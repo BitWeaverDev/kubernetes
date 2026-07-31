@@ -141,19 +141,69 @@ func (w *watchCacheHistory) isCacheFullLocked() bool {
 }
 
 // doCacheResizeLocked resize watchCache's event array with different capacity.
+// capacity may be smaller than the number of events currently held, in which
+// case the oldest events are dropped to make everything fit; callers are
+// responsible for only doing so when those events are safe to drop (i.e.
+// already outside the eventFreshDuration retention window).
 // Assumes that lock is already held for write.
 func (w *watchCacheHistory) doCacheResizeLocked(capacity int) {
-	newCache := make([]*watchCacheEvent, capacity)
-	if capacity < w.capacity {
-		// adjust startIndex if cache capacity shrink.
+	eventCount := w.endIndex - w.startIndex
+	if capacity < eventCount {
+		// New capacity can't hold everything currently in the ring:
+		// advance startIndex to drop the oldest events so the rest fit.
 		w.startIndex = w.endIndex - capacity
 	}
+	newCache := make([]*watchCacheEvent, capacity)
 	for i := w.startIndex; i < w.endIndex; i++ {
 		newCache[i%capacity] = w.cache[i%w.capacity]
 	}
 	w.cache = newCache
 	metrics.RecordsWatchCacheCapacityChange(w.config.groupResource, w.capacity, capacity)
 	w.capacity = capacity
+}
+
+// shrinkIfIdleLocked halves the ring's capacity, down to lowerBoundCapacity,
+// once events have aged out of the eventFreshDuration retention window.
+//
+// resizeCacheLocked's shrink branch (and therefore all shrinking today) is
+// only reachable from updateCache, which only runs when a new event arrives
+// for this resource. A resource whose ring grew to absorb a burst and then
+// goes idle never receives another event to trigger that path, so the ring
+// stays pinned at its burst-time capacity indefinitely - see idleShrinker,
+// which calls this method (via watchCache.shrinkHistoryIfIdle) on a timer
+// instead of on event arrival. Because it isn't gated on the ring being full, it
+// must find its own safe eviction point: only events already outside the
+// freshness window may be dropped, exactly as if they'd been evicted one at
+// a time by updateCache as new events arrived.
+//
+// Assumes that lock is already held for write.
+func (w *watchCacheHistory) shrinkIfIdleLocked(now time.Time) {
+	if w.capacity <= w.lowerBoundCapacity {
+		return
+	}
+	eventCount := w.endIndex - w.startIndex
+	minEventCount := 0
+	if eventCount > 0 {
+		// cache is ordered oldest to newest. Binary search for the first
+		// event still within the retention window; everything before it
+		// has already aged out and is safe to drop.
+		stale := sort.Search(eventCount, func(i int) bool {
+			return now.Sub(w.cache[(w.startIndex+i)%w.capacity].RecordTime) <= w.eventFreshDuration
+		})
+		if stale == 0 {
+			// Even the oldest event we're holding is still within the
+			// retention window: nothing is safe to shrink away yet.
+			return
+		}
+		minEventCount = eventCount - stale
+	}
+	// Step down by halves, same as the event-driven path, rather than
+	// dropping straight to the floor: avoids a single tick collapsing a
+	// large ring, and avoids flapping if churn resumes right after.
+	target := max(w.capacity/2, w.lowerBoundCapacity, minEventCount)
+	if target < w.capacity {
+		w.doCacheResizeLocked(target)
+	}
 }
 
 // isIndexValidLocked checks if a given index is still valid.

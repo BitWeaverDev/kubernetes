@@ -470,6 +470,7 @@ func NewCacherFromConfig(config Config) (*Cacher, error) {
 
 	go cacher.dispatchEvents()
 	go progressRequester.Run(stopCh)
+	go newIdleShrinker(watchCache, config.Clock, eventFreshDuration).Run(stopCh)
 
 	cacher.stopWg.Add(1)
 	go func() {

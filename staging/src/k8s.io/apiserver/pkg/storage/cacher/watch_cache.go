@@ -629,6 +629,18 @@ func (w *watchCache) Resync() error {
 	return nil
 }
 
+// shrinkHistoryIfIdle gives the event history's ring buffer a chance to
+// shrink back down after a burst of churn subsides. It's the counterpart to
+// the normal event-driven resizing in processEvent, which never runs again
+// once a resource stops receiving events - see
+// watchCacheHistory.shrinkIfIdleLocked for why that's necessary, and
+// idleShrinker for what drives this on a timer.
+func (w *watchCache) shrinkHistoryIfIdle(now time.Time) {
+	w.Lock()
+	defer w.Unlock()
+	w.history.shrinkIfIdleLocked(now)
+}
+
 func (w *watchCache) getListResourceVersion() uint64 {
 	w.RLock()
 	defer w.RUnlock()

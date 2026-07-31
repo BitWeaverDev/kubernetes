@@ -964,6 +964,129 @@ func checkCacheElements(cache *testWatchCache) bool {
 	return true
 }
 
+// TestShrinkIfIdleLocked covers the "burst then quiesce" scenario from
+// https://github.com/kubernetes/kubernetes/issues/139250: resizeCacheLocked
+// only ever runs from updateCache, which only runs when a new event
+// arrives, so a ring that grew during a burst and then stops receiving
+// events never gets a chance to shrink back down again. shrinkIfIdleLocked
+// is meant to be driven by a wall-clock timer instead (see idleShrinker), so
+// it must work correctly regardless of whether the ring happens to be full.
+func TestShrinkIfIdleLocked(t *testing.T) {
+	tests := []struct {
+		name               string
+		eventCount         int
+		cacheCapacity      int
+		startIndex         int
+		lowerBoundCapacity int
+		// interval is the time duration between adjacent loaded events.
+		interval time.Duration
+		// nowOffset is added to the timestamp of the last loaded event to
+		// compute "now" for the shrink check.
+		nowOffset        time.Duration
+		expectCapacity   int
+		expectStartIndex int
+	}{
+		{
+			name:               "burst subsides, ring not full: idle-shrink reclaims capacity that resizeCacheLocked cannot",
+			eventCount:         2,
+			cacheCapacity:      8,
+			lowerBoundCapacity: 2,
+			interval:           time.Second,
+			nowOffset:          DefaultEventFreshDuration + time.Second,
+			expectCapacity:     4,
+			expectStartIndex:   0,
+		},
+		{
+			name:               "idle but still fresh: no shrink yet",
+			eventCount:         2,
+			cacheCapacity:      8,
+			lowerBoundCapacity: 2,
+			interval:           time.Second,
+			nowOffset:          DefaultEventFreshDuration / 2,
+			expectCapacity:     8,
+			expectStartIndex:   0,
+		},
+		{
+			name:               "empty ring shrinks toward the lower bound regardless of event staleness",
+			eventCount:         0,
+			cacheCapacity:      8,
+			startIndex:         5,
+			lowerBoundCapacity: 2,
+			expectCapacity:     4,
+			expectStartIndex:   5,
+		},
+		{
+			name:               "already at lower bound: no-op",
+			eventCount:         2,
+			cacheCapacity:      2,
+			lowerBoundCapacity: 2,
+			interval:           time.Second,
+			nowOffset:          DefaultEventFreshDuration * 10,
+			expectCapacity:     2,
+			expectStartIndex:   0,
+		},
+		{
+			name:               "ring left completely full and idle: still shrinks by evicting the now-stale events",
+			eventCount:         8,
+			cacheCapacity:      8,
+			lowerBoundCapacity: 2,
+			interval:           time.Second,
+			nowOffset:          DefaultEventFreshDuration + time.Second,
+			expectCapacity:     4,
+			expectStartIndex:   4,
+		},
+		{
+			name:               "partially stale ring: never shrinks past the oldest still-fresh event",
+			eventCount:         6,
+			cacheCapacity:      8,
+			lowerBoundCapacity: 2,
+			interval:           DefaultEventFreshDuration / 2,
+			expectCapacity:     4,
+			expectStartIndex:   2,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newTestWatchCache(test.cacheCapacity, DefaultEventFreshDuration, &cache.Indexers{})
+			defer store.Stop()
+			store.history.cache = make([]*watchCacheEvent, test.cacheCapacity)
+			store.history.startIndex = test.startIndex
+			store.history.lowerBoundCapacity = test.lowerBoundCapacity
+			loadEventWithDuration(store, test.eventCount, test.interval)
+
+			now := store.config.clock.Now().
+				Add(time.Duration(test.interval.Nanoseconds() * int64(max(test.eventCount-1, 0)))).
+				Add(test.nowOffset)
+
+			if test.eventCount > 0 && test.eventCount < test.cacheCapacity {
+				// Sanity check the bug being fixed: the event-driven path
+				// refuses to shrink a ring that isn't completely full, no
+				// matter how stale its contents are.
+				store.history.resizeCacheLocked(now)
+				if store.history.capacity != test.cacheCapacity {
+					t.Fatalf("resizeCacheLocked unexpectedly changed capacity to %d for a non-full ring; isCacheFullLocked gating must have been bypassed", store.history.capacity)
+				}
+			}
+
+			store.history.shrinkIfIdleLocked(now)
+
+			if store.history.capacity != test.expectCapacity {
+				t.Errorf("expected capacity %d, got %d", test.expectCapacity, store.history.capacity)
+			}
+			if store.history.startIndex != test.expectStartIndex {
+				t.Errorf("expected startIndex %d, got %d", test.expectStartIndex, store.history.startIndex)
+			}
+			if store.history.endIndex != test.startIndex+test.eventCount {
+				t.Errorf("expected endIndex %d, got %d", test.startIndex+test.eventCount, store.history.endIndex)
+			}
+			if !checkCacheElements(store) {
+				t.Errorf("some elements' locations in cache are wrong after shrink")
+			}
+		})
+	}
+}
+
 func TestCacheIncreaseDoesNotBreakWatch(t *testing.T) {
 	store := newTestWatchCache(2, DefaultEventFreshDuration, &cache.Indexers{})
 	defer store.Stop()
